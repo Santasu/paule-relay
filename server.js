@@ -3,28 +3,21 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 8080;
 
-// === ENV (Railway Variables) ===
-// Railway → Settings → Shared Variables:
-// ELEVENLABS_API_KEY = ... (nebūtina ConversationRelay TTS atveju)
-// ELEVEN_VOICE_ID    = quRnZJNH40dJXJwRHnvh
-// ELEVEN_MODEL_ID    = eleven_turbo_v2_5 (Twilio TwiML to nenaudoja, paliekam ateičiai)
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "quRnZJNH40dJXJwRHnvh";
-
+// LT kalbai: naudok Google (Twilio viduje).
+// ElevenLabs per ConversationRelay reikalauja language="en-US" (todėl LT neveiks).
 const LANG = "lt-LT";
+const TTS_PROVIDER = process.env.TTS_PROVIDER || "Google"; // palik "Google"
+
+// Jei nori – gali bandyti nurodyti Google voice (nebūtina).
+// Kai kuriuose setupuose užtenka ttsProvider + language.
+// Pvz: "lt-LT-Standard-B" (kaip tavo Twilio UI mappinge).
+const GOOGLE_VOICE = process.env.GOOGLE_VOICE || ""; // optional
 
 const WELCOME =
   "Labas, čia Vytas iš Paule.ai. Girdžiu jus gerai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
 
-const QUESTIONS = [
-  "Koks jūsų verslas ir kam dažniausiai skambina klientai?",
-  "Ar norit, kad agentas tik registruotų, ar ir parduotų?",
-  "Kur registracija vyksta dabar — Calendly, Google Calendar ar CRM?",
-  "Kokiu laiku daugiausia skambučių ir kokia įprasta trukmė?",
-  "Norite, kad po skambučio klientui ateitų SMS patvirtinimas?",
-];
-
 function escapeXml(s = "") {
-  return s
+  return String(s)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -42,24 +35,22 @@ function toWsUrl(httpUrl) {
 }
 
 function twiml(wsUrl) {
-  // Pastaba: ttsProvider default yra ElevenLabs, bet paliekam aiškiai.
-  // voice — TIK voice ID. Model ID čia NENAUDOJAM. :contentReference[oaicite:2]{index=2}
+  const voiceAttr = GOOGLE_VOICE ? ` voice="${escapeXml(GOOGLE_VOICE)}"` : "";
+  // NOTE: TwiML matysi naršyklėje kaip XML – tai normalu.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="${escapeXml(wsUrl)}"
       language="${escapeXml(LANG)}"
-      ttsProvider="ElevenLabs"
-      voice="${escapeXml(ELEVEN_VOICE_ID)}"
+      ttsProvider="${escapeXml(TTS_PROVIDER)}"${voiceAttr}
       welcomeGreeting="${escapeXml(WELCOME)}"
-      interruptible="any"
-      debug="debugging tokens-played speaker-events"
     />
   </Connect>
 </Response>`;
 }
 
+// ---- VYTAS dialog logika ----
 function norm(t) {
   return (t || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -84,14 +75,20 @@ function isWhatIsThis(t) {
   );
 }
 
+const QUESTIONS = [
+  "Koks jūsų verslas ir kam dažniausiai skambina klientai?",
+  "Ar norit, kad agentas tik registruotų, ar ir parduotų?",
+  "Kur registracija vyksta dabar — Calendly, Google Calendar ar CRM?",
+  "Kokiu laiku daugiausia skambučių ir kokia įprasta trukmė?",
+  "Norite, kad po skambučio klientui ateitų SMS patvirtinimas?"
+];
+
 function newSession() {
-  return { step: 0, mode: "normal", priceStep: 0, greeted: false };
+  return { step: 0, mode: "normal", priceStep: 0 };
 }
 
-// 1 klausimas pabaigoje – visada
 function replyFor(s, userText) {
   const t = norm(userText);
-
   if (!t) return "Girdžiu tylą. Ar mane girdite?";
 
   if (isWhatIsThis(t)) {
@@ -111,10 +108,10 @@ function replyFor(s, userText) {
       return "Ačiū. Antras: ar norit, kad agentas tik registruotų (booking), ar ir aktyviai parduotų telefonu?";
     }
     s.mode = "normal";
-    return "Dažniausiai kaina būna nuo ~149 iki ~499 €/mėn, priklausomai nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderinčiau trumpą 10 min demo šiandien ar rytoj?";
+    return "Dažniausiai kaina būna maždaug nuo 149 iki 499 eurų per mėnesį — priklauso nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderintume trumpą 10 minučių demo šiandien ar rytoj?";
   }
 
-  // Veda per 5 klausimus (vienas per atsakymą)
+  // 5 klausimų kelias
   if (s.step < QUESTIONS.length) {
     const q = QUESTIONS[s.step];
     s.step += 1;
@@ -124,12 +121,7 @@ function replyFor(s, userText) {
   return "Super, supratau. Kada patogiausia 10–15 min demo skambučiui — šiandien ar rytoj?";
 }
 
-// ConversationRelay -> atsakymas turi būti {type:"text", token:"...", last:true} 
-function sendText(ws, text) {
-  ws.send(JSON.stringify({ type: "text", token: text, last: true }));
-}
-
-// HTTP server
+// ---- HTTP server ----
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -139,7 +131,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/twiml") {
     const httpBase = baseUrl(req);
     const wsUrl = toWsUrl(httpBase) + "/ws";
-    console.log("[HTTP] TwiML requested. WS URL =", wsUrl);
+    console.log("TwiML requested. WS URL:", wsUrl);
     res.writeHead(200, { "Content-Type": "text/xml" });
     return res.end(twiml(wsUrl));
   }
@@ -148,75 +140,61 @@ const server = http.createServer((req, res) => {
   res.end("paule-relay running. Use /twiml for Twilio and /health for checks.");
 });
 
-// WS serveris ant /ws
+// ---- WebSocket (ConversationRelay) ----
 const wss = new WebSocketServer({ server, path: "/ws" });
 const sessions = new Map();
 
+function sendText(ws, text) {
+  // Twilio ConversationRelay expects text tokens messages like this. :contentReference[oaicite:6]{index=6}
+  ws.send(JSON.stringify({ type: "text", token: text, last: true }));
+}
+
 wss.on("connection", (ws, req) => {
-  const ip =
-    req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown";
-  console.log("[WS] CONNECT from", ip);
+  console.log(
+    "WS CONNECT from:",
+    req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown"
+  );
 
   ws.on("message", (raw) => {
     let m;
     try {
       m = JSON.parse(raw.toString());
     } catch {
-      console.log("[WS] Non-JSON message ignored");
       return;
     }
 
-    // Patogūs logai: matysi "debugging", "tokens-played", "speaker-events" :contentReference[oaicite:4]{index=4}
-    console.log("[WS] IN:", m.type, m.callSid ? `callSid=${m.callSid}` : "");
-
-    // 1) setup: Twilio pasako callSid ir pan. 
+    // Tipiniai eventai: setup, prompt. :contentReference[oaicite:7]{index=7}
     if (m.type === "setup") {
-      const callSid = m.callSid || `call_${Date.now()}`;
-      ws.callSid = callSid;
+      ws.callSid = m.callSid || `call_${Date.now()}`;
+      sessions.set(ws.callSid, newSession());
 
-      if (!sessions.has(callSid)) sessions.set(callSid, newSession());
-
-      // Nustatom kalbas (galima, bet naudinga stabilumui)
+      // (Nebūtina, bet naudinga) nurodom kalbas
       ws.send(
         JSON.stringify({
           type: "language",
           ttsLanguage: LANG,
-          transcriptionLanguage: LANG,
+          transcriptionLanguage: LANG
         })
       );
       return;
     }
 
-    // 2) prompt: Twilio siunčia vartotojo transkriptą / voicePrompt 
     if (m.type === "prompt") {
       const callSid = ws.callSid || m.callSid || `call_${Date.now()}`;
       if (!sessions.has(callSid)) sessions.set(callSid, newSession());
 
-      const s = sessions.get(callSid);
       const userText = m.voicePrompt || m.transcript || m.text || "";
+      const s = sessions.get(callSid);
 
-      const answer = replyFor(s, userText);
-      sendText(ws, answer);
+      const out = replyFor(s, userText);
+      sendText(ws, out);
       return;
     }
-
-    // 3) interrupt: jei caller pertraukė – galima reaguoti (nebūtina, bet tvarkinga) 
-    if (m.type === "interrupt") {
-      console.log("[WS] interrupt received");
-      return;
-    }
-
-    // debug eventai iš Twilio (kai įjungtas debug=...) – tiesiog loginam
-    if (m.type) return;
   });
 
   ws.on("close", () => {
-    console.log("[WS] CLOSE", ws.callSid || "");
+    console.log("WS CLOSE", ws.callSid || "");
     if (ws.callSid) sessions.delete(ws.callSid);
-  });
-
-  ws.on("error", (e) => {
-    console.log("[WS] ERROR", e?.message || e);
   });
 });
 
