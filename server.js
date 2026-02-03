@@ -3,16 +3,7 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 8080;
 
-// LT kalbai: naudok Google (Twilio viduje).
-// ElevenLabs per ConversationRelay reikalauja language="en-US" (todėl LT neveiks).
 const LANG = "lt-LT";
-const TTS_PROVIDER = process.env.TTS_PROVIDER || "Google"; // palik "Google"
-
-// Jei nori – gali bandyti nurodyti Google voice (nebūtina).
-// Kai kuriuose setupuose užtenka ttsProvider + language.
-// Pvz: "lt-LT-Standard-B" (kaip tavo Twilio UI mappinge).
-const GOOGLE_VOICE = process.env.GOOGLE_VOICE || ""; // optional
-
 const WELCOME =
   "Labas, čia Vytas iš Paule.ai. Girdžiu jus gerai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
 
@@ -30,27 +21,27 @@ function baseUrl(req) {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}`;
 }
+
 function toWsUrl(httpUrl) {
   return httpUrl.replace("https://", "wss://").replace("http://", "ws://");
 }
 
 function twiml(wsUrl) {
-  const voiceAttr = GOOGLE_VOICE ? ` voice="${escapeXml(GOOGLE_VOICE)}"` : "";
-  // NOTE: TwiML matysi naršyklėje kaip XML – tai normalu.
+  // PIRMAM TESTUI – Google TTS + lt-LT (be voice)
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="${escapeXml(wsUrl)}"
       language="${escapeXml(LANG)}"
-      ttsProvider="${escapeXml(TTS_PROVIDER)}"${voiceAttr}
+      ttsProvider="Google"
       welcomeGreeting="${escapeXml(WELCOME)}"
     />
   </Connect>
 </Response>`;
 }
 
-// ---- VYTAS dialog logika ----
+// Paprastas dialogas (kad visada kažką sakytų)
 function norm(t) {
   return (t || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -108,10 +99,9 @@ function replyFor(s, userText) {
       return "Ačiū. Antras: ar norit, kad agentas tik registruotų (booking), ar ir aktyviai parduotų telefonu?";
     }
     s.mode = "normal";
-    return "Dažniausiai kaina būna maždaug nuo 149 iki 499 eurų per mėnesį — priklauso nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderintume trumpą 10 minučių demo šiandien ar rytoj?";
+    return "Dažniausiai kaina būna nuo ~149 iki ~499 €/mėn, priklausomai nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderinčiau trumpą 10–15 min demo šiandien ar rytoj?";
   }
 
-  // 5 klausimų kelias
   if (s.step < QUESTIONS.length) {
     const q = QUESTIONS[s.step];
     s.step += 1;
@@ -121,7 +111,7 @@ function replyFor(s, userText) {
   return "Super, supratau. Kada patogiausia 10–15 min demo skambučiui — šiandien ar rytoj?";
 }
 
-// ---- HTTP server ----
+// HTTP
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -140,42 +130,26 @@ const server = http.createServer((req, res) => {
   res.end("paule-relay running. Use /twiml for Twilio and /health for checks.");
 });
 
-// ---- WebSocket (ConversationRelay) ----
+// WS (ConversationRelay)
 const wss = new WebSocketServer({ server, path: "/ws" });
 const sessions = new Map();
 
 function sendText(ws, text) {
-  // Twilio ConversationRelay expects text tokens messages like this. :contentReference[oaicite:6]{index=6}
+  // Twilio tikisi "text" tokenų formato (token + last) :contentReference[oaicite:1]{index=1}
   ws.send(JSON.stringify({ type: "text", token: text, last: true }));
 }
 
 wss.on("connection", (ws, req) => {
-  console.log(
-    "WS CONNECT from:",
-    req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown"
-  );
+  console.log("WS CONNECT from:", req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown");
 
   ws.on("message", (raw) => {
     let m;
-    try {
-      m = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { m = JSON.parse(raw.toString()); } catch { return; }
 
-    // Tipiniai eventai: setup, prompt. :contentReference[oaicite:7]{index=7}
+    // Twilio siunčia "setup" ir "prompt" įvykius :contentReference[oaicite:2]{index=2}
     if (m.type === "setup") {
       ws.callSid = m.callSid || `call_${Date.now()}`;
       sessions.set(ws.callSid, newSession());
-
-      // (Nebūtina, bet naudinga) nurodom kalbas
-      ws.send(
-        JSON.stringify({
-          type: "language",
-          ttsLanguage: LANG,
-          transcriptionLanguage: LANG
-        })
-      );
       return;
     }
 
@@ -186,8 +160,8 @@ wss.on("connection", (ws, req) => {
       const userText = m.voicePrompt || m.transcript || m.text || "";
       const s = sessions.get(callSid);
 
-      const out = replyFor(s, userText);
-      sendText(ws, out);
+      const answer = replyFor(s, userText);
+      sendText(ws, answer);
       return;
     }
   });
@@ -199,3 +173,4 @@ wss.on("connection", (ws, req) => {
 });
 
 server.listen(PORT, () => console.log("Listening on", PORT));
+
