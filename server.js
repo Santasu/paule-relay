@@ -3,9 +3,11 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 8080;
 
-const ELEVEN_VOICE =
-  "quRnZJNH40dJXJwRHnvh-turbo_v2_5-1.0_0.45_0.92";
+// ====== KONFIG ======
 const LANG = "lt-LT";
+
+// Patikimiausia: Google TTS (veikia “out of the box” per Twilio)
+const TTS_PROVIDER = "Google"; // Google | Amazon | ElevenLabs
 
 const WELCOME =
   "Labas, čia Vytas iš Paule.ai. Girdžiu jus gerai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
@@ -30,14 +32,16 @@ function toWsUrl(httpUrl) {
 }
 
 function twiml(wsUrl) {
+  // NOTE: Sąmoningai NENAUDOJAM voice=.
+  // Twilio parinks default balsą pagal language + provider (stabiliausia).
+  // Vėliau galėsim įdėti voice="..." iš Twilio TTS lentelės.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="${escapeXml(wsUrl)}"
       language="${escapeXml(LANG)}"
-      ttsProvider="ElevenLabs"
-      voice="${escapeXml(ELEVEN_VOICE)}"
+      ttsProvider="${escapeXml(TTS_PROVIDER)}"
       welcomeGreeting="${escapeXml(WELCOME)}"
     />
   </Connect>
@@ -104,9 +108,8 @@ function replyFor(s, userText) {
     return "Dažniausiai kaina būna nuo ~149 iki ~499 €/mėn, priklausomai nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderinčiau trumpą 10 min demo šiandien ar rytoj?";
   }
 
-  // 5 klausimų kelias
+  // 5 klausimų kelias (po 1 klausimą)
   if (s.step < QUESTIONS.length) {
-    // pirmą kartą po welcome: paklausiam Q0
     const q = QUESTIONS[s.step];
     s.step += 1;
     return q;
@@ -125,7 +128,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/twiml") {
     const httpBase = baseUrl(req);
     const wsUrl = toWsUrl(httpBase) + "/ws";
-    console.log("TwiML requested. WS URL:", wsUrl);
+    console.log("TwiML requested. WS URL:", wsUrl, "TTS:", TTS_PROVIDER, "LANG:", LANG);
     res.writeHead(200, { "Content-Type": "text/xml" });
     return res.end(twiml(wsUrl));
   }
@@ -139,27 +142,39 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 const sessions = new Map();
 
 function sendText(ws, text) {
+  // Teisingas ConversationRelay atsakymo formatas: type=text token=... last=true
   ws.send(JSON.stringify({ type: "text", token: text, last: true }));
 }
 
 wss.on("connection", (ws, req) => {
-  console.log("WS CONNECT from:", req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown");
+  console.log(
+    "WS CONNECT from:",
+    req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown"
+  );
 
   ws.on("message", (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
+
     console.log("WS IN:", m.type, m.callSid || "");
 
     if (m.type === "setup") {
       ws.callSid = m.callSid || `call_${Date.now()}`;
       sessions.set(ws.callSid, newSession());
-      ws.send(JSON.stringify({ type: "language", ttsLanguage: LANG, transcriptionLanguage: LANG }));
+
+      // rekomenduojama: language message (bet voice keisti mid-session negalima)
+      ws.send(JSON.stringify({
+        type: "language",
+        ttsLanguage: LANG,
+        transcriptionLanguage: LANG
+      }));
       return;
     }
 
     if (m.type === "prompt") {
       const callSid = ws.callSid || m.callSid || `call_${Date.now()}`;
       if (!sessions.has(callSid)) sessions.set(callSid, newSession());
+
       const userText = m.voicePrompt || m.transcript || m.text || "";
       const s = sessions.get(callSid);
       sendText(ws, replyFor(s, userText));
