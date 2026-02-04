@@ -52,6 +52,11 @@ Atsakyk glaustai ir maksimaliai zmogiskai.
 Visada uzbaik vienu klausimu.
 Jei klausia kainos: pasakyk, kad priklauso nuo apimties, ir paklausk 2 klausimu.`;
 
+const TWIML_MODE = String(process.env.TWIML_MODE || "relay").toLowerCase();
+const SAY_DIAGNOSTIC_TEXT =
+  process.env.SAY_DIAGNOSTIC_TEXT ||
+  "Labas. Tai diagnostinis skambutis. Jeigu girdite mane, TwiML veikia teisingai.";
+
 const METRICS = {
   startedAt: new Date().toISOString(),
   websocket: {
@@ -216,6 +221,23 @@ function twiml(wsUrl) {
 </Response>`;
 }
 
+function sayTwiml(text) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="${escapeXml(RELAY_LANGUAGE)}">${escapeXml(text)}</Say>
+</Response>`;
+}
+
+function sayThenRelayTwiml(wsUrl) {
+  const relay = twiml(wsUrl);
+  return relay.replace(
+    "<Connect>",
+    `<Say language="${escapeXml(RELAY_LANGUAGE)}">${escapeXml(
+      "Labas. Dabar jungiames prie AI asistento."
+    )}</Say>\n  <Connect>`
+  );
+}
+
 function buildHealthPayload() {
   return {
     status: "ok",
@@ -228,6 +250,7 @@ function buildHealthPayload() {
     transcriptionProvider: TRANSCRIPTION_PROVIDER,
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
+    twimlMode: TWIML_MODE,
     advancedRelayAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
@@ -799,9 +822,14 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/twiml") {
     const wsUrl = `${toWsUrl(baseUrl(req))}/ws`;
-    const xml = twiml(wsUrl);
+    const mode = String(url.searchParams.get("mode") || TWIML_MODE || "relay").toLowerCase();
+    let xml = twiml(wsUrl);
+    if (mode === "say") xml = sayTwiml(SAY_DIAGNOSTIC_TEXT);
+    if (mode === "say_then_relay") xml = sayThenRelayTwiml(wsUrl);
 
     logEvent("http.twiml", {
+      method: req.method,
+      mode,
       wsUrl,
       relayLanguage: RELAY_LANGUAGE,
       ttsProvider: twilioTtsProviderName(TTS_PROVIDER),
@@ -814,6 +842,16 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(xml);
+    return;
+  }
+
+  if (url.pathname === "/twiml-say") {
+    logEvent("http.twiml_say", {
+      method: req.method,
+      relayLanguage: RELAY_LANGUAGE,
+    });
+    res.writeHead(200, { "Content-Type": "text/xml" });
+    res.end(sayTwiml(SAY_DIAGNOSTIC_TEXT));
     return;
   }
 
@@ -893,6 +931,7 @@ server.listen(PORT, () => {
     transcriptionProvider: TRANSCRIPTION_PROVIDER,
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
+    twimlMode: TWIML_MODE,
     advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
