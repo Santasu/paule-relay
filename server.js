@@ -1,12 +1,63 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 
+/**
+ * ✅ Twilio <ConversationRelay> + OpenAI streaming -> Twilio text tokens (low latency)
+ * ✅ Default TTS: Google (kad 100% kalbėtų)
+ * ✅ Switch per env: TTS_PROVIDER=google|eleven
+ *
+ * REQUIRED ENV:
+ *   OPENAI_API_KEY=...
+ *
+ * OPTIONAL ENV:
+ *   OPENAI_MODEL=gpt-5-mini (ar koks nori)
+ *   LANG=lt-LT
+ *   TTS_PROVIDER=google|eleven      (default: google)
+ *
+ * GOOGLE (optional):
+ *   GOOGLE_VOICE=...                (jei Twilio palaiko voice paramą Google provider’iui)
+ *
+ * ELEVEN (Twilio Relay integracija, NE tavo tiesioginis Eleven API):
+ *   ELEVEN_VOICE_ID=quRnZJNH40dJXJwRHnvh
+ *   ELEVEN_MODEL=turbo_v2_5         (Twilio dažnai palaiko: flash_v2_5 / turbo_v2_5 / ...)
+ *   ELEVEN_SPEED=1.0
+ *   ELEVEN_STABILITY=0.45
+ *   ELEVEN_SIMILARITY=0.92
+ */
+
 const PORT = process.env.PORT || 8080;
 
-const LANG = "lt-LT";
+// ---- AI ----
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+
+// ---- LANG / TTS ----
+const LANG = process.env.LANG || "lt-LT";
+const TTS_PROVIDER = (process.env.TTS_PROVIDER || "google").toLowerCase(); // google | eleven
+
+// Google voice (jei Twilio priima voice param, paliekam optional)
+const GOOGLE_VOICE = process.env.GOOGLE_VOICE || "";
+
+// Eleven (Relay integracija per Twilio)
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "quRnZJNH40dJXJwRHnvh";
+const ELEVEN_MODEL = process.env.ELEVEN_MODEL || "turbo_v2_5";
+const ELEVEN_SPEED = process.env.ELEVEN_SPEED || "1.0";
+const ELEVEN_STABILITY = process.env.ELEVEN_STABILITY || "0.45";
+const ELEVEN_SIMILARITY = process.env.ELEVEN_SIMILARITY || "0.92";
+
 const WELCOME =
   "Labas, čia Vytas iš Paule.ai. Girdžiu jus gerai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
 
+const SYSTEM_PROMPT =
+  process.env.SYSTEM_PROMPT ||
+  `Tu esi Vytas iš Paule.ai.
+Kalbi lietuviškai, ramiai, trumpais sakiniais, be robotinio tono.
+Tikslas: suprasti poreikį ir pasiūlyti užbookinti laiką.
+Visada užbaik 1 klausimu.
+Jei žmogus šaltas – pasiūlyk 30 sek paaiškinimą ir paklausk ar tęsti.
+Jei klausia kainos – sakyk: "priklauso nuo apimties, užduosiu 2 klausimus ir pasakysiu intervalą".`;
+
+// ----------------- helpers -----------------
 function escapeXml(s = "") {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -26,92 +77,117 @@ function toWsUrl(httpUrl) {
   return httpUrl.replace("https://", "wss://").replace("http://", "ws://");
 }
 
+/**
+ * Twilio ConversationRelay ElevenLabs voice format:
+ * voice="VOICEID-MODEL-SPEED_STABILITY_SIMILARITY"
+ */
+function elevenVoiceString() {
+  return `${ELEVEN_VOICE_ID}-${ELEVEN_MODEL}-${ELEVEN_SPEED}_${ELEVEN_STABILITY}_${ELEVEN_SIMILARITY}`;
+}
+
 function twiml(wsUrl) {
-  // PIRMAM TESTUI – Google TTS + lt-LT (be voice)
+  const provider = TTS_PROVIDER === "eleven" ? "ElevenLabs" : "Google";
+
+  // Voice atributas: vienur veikia, vienur ignoruojamas – todėl darom "optional"
+  let voiceAttr = "";
+  if (provider === "ElevenLabs") {
+    voiceAttr = `voice="${escapeXml(elevenVoiceString())}"`;
+  } else if (provider === "Google" && GOOGLE_VOICE) {
+    voiceAttr = `voice="${escapeXml(GOOGLE_VOICE)}"`;
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="${escapeXml(wsUrl)}"
       language="${escapeXml(LANG)}"
-      ttsProvider="Google"
+      ttsProvider="${escapeXml(provider)}"
+      ${voiceAttr}
       welcomeGreeting="${escapeXml(WELCOME)}"
     />
   </Connect>
 </Response>`;
 }
 
-// Paprastas dialogas (kad visada kažką sakytų)
-function norm(t) {
-  return (t || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
-}
-function isPrice(t) {
-  return (
-    t.includes("kaina") ||
-    t.includes("kainos") ||
-    t.includes("kiek kain") ||
-    t.includes("kiek mok") ||
-    t.includes("kiek eur") ||
-    t.includes("kiek €")
-  );
-}
-function isWhatIsThis(t) {
-  return (
-    t.includes("kas čia") ||
-    t.includes("kas cia") ||
-    t.includes("kas jūs") ||
-    t.includes("kas jus") ||
-    t.includes("kas tu") ||
-    t.includes("kas per")
-  );
+function safeJsonParse(raw) {
+  try {
+    return JSON.parse(raw.toString());
+  } catch {
+    return null;
+  }
 }
 
-const QUESTIONS = [
-  "Koks jūsų verslas ir kam dažniausiai skambina klientai?",
-  "Ar norit, kad agentas tik registruotų, ar ir parduotų?",
-  "Kur registracija vyksta dabar — Calendly, Google Calendar ar CRM?",
-  "Kokiu laiku daugiausia skambučių ir kokia įprasta trukmė?",
-  "Norite, kad po skambučio klientui ateitų SMS patvirtinimas?"
-];
-
-function newSession() {
-  return { step: 0, mode: "normal", priceStep: 0 };
-}
-
-function replyFor(s, userText) {
-  const t = norm(userText);
-  if (!t) return "Girdžiu tylą. Ar mane girdite?";
-
-  if (isWhatIsThis(t)) {
-    s.step = Math.max(s.step, 1);
-    return "Trumpai: mes įdiegiame AI skambučių agentą, kuris atsiliepia 24/7, kalba lietuviškai ir gali užregistruoti į kalendorių. Kokiame versle dirbate?";
+// ------------- OpenAI streaming (Responses API SSE) -------------
+async function* openaiStream({ userText, callSid, signal }) {
+  if (!OPENAI_API_KEY) {
+    yield "Neturiu OPENAI_API_KEY. Įrašyk jį Railway Variables.";
+    return;
   }
 
-  if (isPrice(t)) {
-    s.mode = "price_probe";
-    s.priceStep = 0;
-    return "Priklauso nuo apimties. Galiu užduoti 2 klausimus ir pasakyti kainos intervalą. Pirmas: kiek maždaug skambučių per dieną gaunate?";
+  const body = {
+    model: OPENAI_MODEL,
+    stream: true,
+    input: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: `Skambutis (${callSid}). Vartotojas: ${userText}` },
+    ],
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!resp.ok || !resp.body) {
+    const t = await resp.text().catch(() => "");
+    yield `AI klaida: ${resp.status}. ${t}`.slice(0, 300);
+    return;
   }
 
-  if (s.mode === "price_probe") {
-    if (s.priceStep === 0) {
-      s.priceStep = 1;
-      return "Ačiū. Antras: ar norit, kad agentas tik registruotų (booking), ar ir aktyviai parduotų telefonu?";
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return;
+
+        let json;
+        try {
+          json = JSON.parse(data);
+        } catch {
+          continue;
+        }
+
+        if (json?.type === "response.output_text.delta" && typeof json.delta === "string") {
+          yield json.delta;
+        }
+        if (json?.type === "response.output_text" && typeof json.text === "string") {
+          yield json.text;
+        }
+      }
     }
-    s.mode = "normal";
-    return "Dažniausiai kaina būna nuo ~149 iki ~499 €/mėn, priklausomai nuo skambučių kiekio, scenarijų ir integracijų. Norit, kad suderinčiau trumpą 10–15 min demo šiandien ar rytoj?";
   }
-
-  if (s.step < QUESTIONS.length) {
-    const q = QUESTIONS[s.step];
-    s.step += 1;
-    return q;
-  }
-
-  return "Super, supratau. Kada patogiausia 10–15 min demo skambučiui — šiandien ar rytoj?";
 }
 
-// HTTP
+// ----------------- HTTP server -----------------
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -121,56 +197,119 @@ const server = http.createServer((req, res) => {
   if (req.url === "/twiml") {
     const httpBase = baseUrl(req);
     const wsUrl = toWsUrl(httpBase) + "/ws";
-    console.log("TwiML requested. WS URL:", wsUrl);
+
+    console.log("[HTTP] /twiml requested",
+      "| provider:", TTS_PROVIDER,
+      "| wsUrl:", wsUrl
+    );
+
     res.writeHead(200, { "Content-Type": "text/xml" });
     return res.end(twiml(wsUrl));
   }
 
+  // root
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("paule-relay running. Use /twiml for Twilio and /health for checks.");
+  res.end("paule-relay running. Use /twiml and /health");
 });
 
-// WS (ConversationRelay)
+// ----------------- WS server (Twilio ConversationRelay) -----------------
 const wss = new WebSocketServer({ server, path: "/ws" });
-const sessions = new Map();
 
-function sendText(ws, text) {
-  // Twilio tikisi "text" tokenų formato (token + last) :contentReference[oaicite:1]{index=1}
-  ws.send(JSON.stringify({ type: "text", token: text, last: true }));
+// per call: allow cancel old stream (interrupt)
+const sessions = new Map(); // callSid -> { busy, aborter }
+
+function sendToken(ws, token, last) {
+  ws.send(JSON.stringify({ type: "text", token, last }));
 }
 
 wss.on("connection", (ws, req) => {
-  console.log("WS CONNECT from:", req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown");
+  const ip = req?.headers?.["x-forwarded-for"] || req?.socket?.remoteAddress || "unknown";
+  console.log("[WS] CONNECT from", ip);
 
-  ws.on("message", (raw) => {
-    let m;
-    try { m = JSON.parse(raw.toString()); } catch { return; }
+  ws.on("message", async (raw) => {
+    const m = safeJsonParse(raw);
+    if (!m?.type) return;
 
-    // Twilio siunčia "setup" ir "prompt" įvykius :contentReference[oaicite:2]{index=2}
     if (m.type === "setup") {
       ws.callSid = m.callSid || `call_${Date.now()}`;
-      sessions.set(ws.callSid, newSession());
+      sessions.set(ws.callSid, { busy: false, aborter: null });
+
+      console.log("[WS] setup", ws.callSid);
+
+      // Twilio language config message (ok jei ignoruos)
+      ws.send(JSON.stringify({
+        type: "language",
+        ttsLanguage: LANG,
+        transcriptionLanguage: LANG,
+      }));
       return;
     }
 
     if (m.type === "prompt") {
       const callSid = ws.callSid || m.callSid || `call_${Date.now()}`;
-      if (!sessions.has(callSid)) sessions.set(callSid, newSession());
-
-      const userText = m.voicePrompt || m.transcript || m.text || "";
+      if (!sessions.has(callSid)) sessions.set(callSid, { busy: false, aborter: null });
       const s = sessions.get(callSid);
 
-      const answer = replyFor(s, userText);
-      sendText(ws, answer);
+      // cancel previous stream if still running
+      if (s.aborter) {
+        try { s.aborter.abort(); } catch {}
+        s.aborter = null;
+      }
+
+      const userText = (m.voicePrompt || m.transcript || m.text || "").toString().trim();
+      console.log("[WS] prompt", callSid, "text:", userText);
+
+      if (!userText) {
+        sendToken(ws, "Girdžiu tylą. Ar mane girdite?", true);
+        return;
+      }
+
+      // start AI stream
+      const aborter = new AbortController();
+      s.aborter = aborter;
+
+      try {
+        let sentAny = false;
+
+        // Greitesnis TTS: siųsk gabaliukais ASAP
+        for await (const delta of openaiStream({ userText, callSid, signal: aborter.signal })) {
+          if (!delta) continue;
+          sendToken(ws, delta, false);
+          sentAny = true;
+        }
+
+        // end marker
+        sendToken(ws, "", true);
+
+        if (!sentAny) {
+          sendToken(ws, "Supratau. Koks jūsų verslas?", true);
+        }
+      } catch (e) {
+        const msg = (e?.name === "AbortError")
+          ? "[WS] stream aborted (interruption)"
+          : `[WS] AI error: ${e?.message || e}`;
+        console.log(msg);
+
+        if (e?.name !== "AbortError") {
+          sendToken(ws, "Atsiprašau, įvyko klaida. Pakartokite, prašau.", true);
+        }
+      } finally {
+        s.aborter = null;
+      }
       return;
     }
+
+    // log other events if needed:
+    // console.log("[WS] event", m.type);
   });
 
   ws.on("close", () => {
-    console.log("WS CLOSE", ws.callSid || "");
+    console.log("[WS] CLOSE", ws.callSid || "");
     if (ws.callSid) sessions.delete(ws.callSid);
   });
 });
 
-server.listen(PORT, () => console.log("Listening on", PORT));
-
+server.listen(PORT, () => {
+  console.log("Listening on", PORT);
+  console.log("TTS_PROVIDER =", TTS_PROVIDER);
+});
