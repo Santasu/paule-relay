@@ -3,42 +3,42 @@ import { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 8080;
 
-// ====== AI (OpenAI) ======
+// === OpenAI ===
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 
-// ====== LANG ======
-// Jei lt-LT meta 64101 / invalid, testui uždėk en-US ir pasitikrink, kad gyva.
-// Tada bandysi grąžint lt-LT.
-const TRANSCRIBE_LANG = process.env.TRANSCRIBE_LANG || "en-US";
-const TTS_LANG = process.env.TTS_LANG || "en-US";
-
-// ====== TTS provider switch ======
+// === Relay / TTS switch ===
 const TTS_PROVIDER = (process.env.TTS_PROVIDER || "google").toLowerCase(); // google | eleven
 
-// --- Google TTS (per Twilio ConversationRelay) ---
-// Twilio Google voice format dažnai būna: "Google.<voiceName>"
-// Pvz: Google.en-US-Standard-C, Google.en-US-Wavenet-D, ir pan.
-const GOOGLE_VOICE = process.env.GOOGLE_VOICE || "Google.en-US-Standard-C";
+// IMPORTANT: ConversationRelay language default is en-US.
+// Dėl tavo 64101 klaidų pirmam startui paliekam en-US.
+const RELAY_LANGUAGE = process.env.RELAY_LANGUAGE || "en-US";
 
-// --- ElevenLabs (per Twilio ConversationRelay provider) ---
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "";     // pvz: quRnZJNH40dJXJwRHnvh
-const ELEVEN_MODEL = process.env.ELEVEN_MODEL || "turbo_v2_5"; // Twilio palaikomi model strings (turbo_v2_5, flash_v2_5, etc.)
+// === Eleven (Tik kai TTS_PROVIDER=eleven) ===
+// Twilio ConversationRelay Eleven formatas: voice="VOICEID-MODEL-SPEED_STABILITY_SIMILARITY"
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "";
+const ELEVEN_MODEL = process.env.ELEVEN_MODEL || "turbo_v2_5";
 const ELEVEN_SPEED = process.env.ELEVEN_SPEED || "1.0";
 const ELEVEN_STABILITY = process.env.ELEVEN_STABILITY || "0.45";
 const ELEVEN_SIMILARITY = process.env.ELEVEN_SIMILARITY || "0.92";
 
+// === Google voice (optional) ===
+// Jei Twilio leidžia – gali įrašyt konkrečią Google voice reikšmę.
+// Jei nežinai – palik tuščią, tada Twilio parinks default.
+const GOOGLE_VOICE = process.env.GOOGLE_VOICE || "";
+
+// === Prompts ===
 const WELCOME =
   process.env.WELCOME ||
-  "Labas, čia Vytas iš Paule.ai. Girdžiu jus gerai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
+  "Labas, čia Vytas iš Paule.ai. Dėl ko skambinate — pardavimai, klientų aptarnavimas ar registracija?";
 
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   `Tu esi Vytas iš Paule.ai.
-Kalbi lietuviškai (jei klientas kalba lietuviškai), trumpais sakiniais, natūraliai.
+Kalbi LIETUVIŠKAI, natūraliai, trumpais sakiniais.
 Tikslas: suprasti poreikį ir pasiūlyti užbookinti laiką.
-Visada pabaigoje užduok 1 klausimą.
-Jei klausia kainos: "priklauso nuo apimties – užduosiu 2 klausimus ir pasakysiu intervalą".`;
+Visada užbaik vienu klausimu.
+Jei klausia kainos: pasakyk, kad priklauso nuo apimties ir paklausk 2 klausimų.`;
 
 function escapeXml(s = "") {
   return String(s)
@@ -58,69 +58,43 @@ function toWsUrl(httpUrl) {
   return httpUrl.replace("https://", "wss://").replace("http://", "ws://");
 }
 
-// Twilio ConversationRelay ElevenLabs voice format (pagal Twilio pavyzdžius):
-// voice="VOICEID-MODEL-SPEED_STABILITY_SIMILARITY"
 function elevenVoiceString() {
+  if (!ELEVEN_VOICE_ID) return "";
   return `${ELEVEN_VOICE_ID}-${ELEVEN_MODEL}-${ELEVEN_SPEED}_${ELEVEN_STABILITY}_${ELEVEN_SIMILARITY}`;
 }
 
-function buildConversationRelayAttrs(wsUrl) {
-  // Twilio invalid parameter dažniausiai būna dėl:
-// - neteisingo ttsProvider (case/leidžiamos reikšmės)
-// - trūkstamo voice (pvz. Google)
-// - neteisingos kalbos reikšmės
+// --- TwiML ---
+function twiml(wsUrl) {
+  // Minimalus, validus ConversationRelay.
+  // language paliekam en-US, kad nesprogtų 64101.
+  // voice duodam tik jei tikrai reikia.
+  const attrs = [];
+
+  attrs.push(`url="${escapeXml(wsUrl)}"`);
+  attrs.push(`language="${escapeXml(RELAY_LANGUAGE)}"`);
+  attrs.push(`welcomeGreeting="${escapeXml(WELCOME)}"`);
 
   if (TTS_PROVIDER === "eleven") {
-    if (!ELEVEN_VOICE_ID) {
-      // jei nepaduotas voice id – geriau fallback į google, kad bent kalbėtų
-      return {
-        ttsProvider: "google",
-        voice: GOOGLE_VOICE,
-      };
-    }
-    return {
-      ttsProvider: "ElevenLabs",
-      voice: elevenVoiceString(),
-    };
+    const v = elevenVoiceString();
+    attrs.push(`ttsProvider="ElevenLabs"`);
+    if (v) attrs.push(`voice="${escapeXml(v)}"`);
+  } else {
+    attrs.push(`ttsProvider="Google"`);
+    if (GOOGLE_VOICE) attrs.push(`voice="${escapeXml(GOOGLE_VOICE)}"`);
   }
-
-  // Default: google
-  return {
-    ttsProvider: "google",
-    voice: GOOGLE_VOICE,
-  };
-}
-
-function twiml(wsUrl) {
-  const { ttsProvider, voice } = buildConversationRelayAttrs(wsUrl);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay
-      url="${escapeXml(wsUrl)}"
-      transcriptionLanguage="${escapeXml(TRANSCRIBE_LANG)}"
-      ttsLanguage="${escapeXml(TTS_LANG)}"
-      ttsProvider="${escapeXml(ttsProvider)}"
-      voice="${escapeXml(voice)}"
-      welcomeGreeting="${escapeXml(WELCOME)}"
-    />
+    <ConversationRelay ${attrs.join(" ")} />
   </Connect>
 </Response>`;
 }
 
-function twimlFallback() {
-  // Jei Relay nepasileidžia, bent pasakys balsu „fallback“
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Atsiprasau, siuo metu vyksta konfiguracijos klaida. Pabandykite veliau.</Say>
-</Response>`;
-}
-
-// --- OpenAI Streaming (Responses API SSE) ---
+// --- OpenAI streaming (Responses API SSE) ---
 async function* openaiStream({ userText, callSid }) {
   if (!OPENAI_API_KEY) {
-    yield "Trūksta OPENAI_API_KEY (Railway Variables).";
+    yield "Neturiu OPENAI_API_KEY. Įrašyk jį Railway Variables.";
     return;
   }
 
@@ -144,7 +118,7 @@ async function* openaiStream({ userText, callSid }) {
 
   if (!resp.ok || !resp.body) {
     const t = await resp.text().catch(() => "");
-    yield `AI klaida: ${resp.status}. ${t}`.slice(0, 400);
+    yield `Klaida iš AI: ${resp.status}. ${t}`.slice(0, 400);
     return;
   }
 
@@ -155,7 +129,6 @@ async function* openaiStream({ userText, callSid }) {
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-
     buf += decoder.decode(value, { stream: true });
 
     let idx;
@@ -169,11 +142,16 @@ async function* openaiStream({ userText, callSid }) {
         if (data === "[DONE]") return;
 
         let json;
-        try { json = JSON.parse(data); } catch { continue; }
+        try {
+          json = JSON.parse(data);
+        } catch {
+          continue;
+        }
 
         if (json?.type === "response.output_text.delta" && typeof json.delta === "string") {
           yield json.delta;
-        } else if (json?.type === "response.output_text" && typeof json.text === "string") {
+        }
+        if (json?.type === "response.output_text" && typeof json.text === "string") {
           yield json.text;
         }
       }
@@ -182,10 +160,14 @@ async function* openaiStream({ userText, callSid }) {
 }
 
 function safeJsonParse(raw) {
-  try { return JSON.parse(raw.toString()); } catch { return null; }
+  try {
+    return JSON.parse(raw.toString());
+  } catch {
+    return null;
+  }
 }
 
-// ====== HTTP server ======
+// --- HTTP server ---
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -195,23 +177,17 @@ const server = http.createServer((req, res) => {
   if (req.url === "/twiml") {
     const httpBase = baseUrl(req);
     const wsUrl = toWsUrl(httpBase) + "/ws";
-    console.log("[HTTP] /twiml ->", wsUrl, "TTS_PROVIDER:", TTS_PROVIDER);
+    console.log("[HTTP] /twiml ->", wsUrl, "TTS_PROVIDER=", TTS_PROVIDER, "LANG=", RELAY_LANGUAGE);
     res.writeHead(200, { "Content-Type": "text/xml" });
     return res.end(twiml(wsUrl));
   }
 
-  if (req.url === "/twiml-fallback") {
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    return res.end(twimlFallback());
-  }
-
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("paule-relay running. Use /twiml, /twiml-fallback and /health");
+  res.end("paule-relay running. Use /twiml and /health");
 });
 
-// ====== WS server (Twilio ConversationRelay) ======
+// --- WS Relay ---
 const wss = new WebSocketServer({ server, path: "/ws" });
-
 const sessions = new Map(); // callSid -> { busy }
 
 function sendTextToken(ws, token, last) {
@@ -264,12 +240,17 @@ wss.on("connection", (ws, req) => {
       } finally {
         s.busy = false;
       }
+      return;
     }
   });
 
   ws.on("close", () => {
-    if (ws.callSid) sessions.delete(ws.callSid);
-    console.log("[WS] CLOSE", ws.callSid || "");
+    if (ws.callSid) {
+      sessions.delete(ws.callSid);
+      console.log("[WS] CLOSE", ws.callSid);
+    } else {
+      console.log("[WS] CLOSE");
+    }
   });
 });
 
