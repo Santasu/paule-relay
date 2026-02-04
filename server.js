@@ -22,9 +22,11 @@ const REPORT_INPUT_DURING_AGENT_SPEECH = process.env.REPORT_INPUT_DURING_AGENT_S
 const ENABLE_ADVANCED_RELAY_ATTRIBUTES =
   String(process.env.ENABLE_ADVANCED_RELAY_ATTRIBUTES || "false").toLowerCase() === "true";
 const SEND_SETUP_LANGUAGE_MESSAGE =
-  String(process.env.SEND_SETUP_LANGUAGE_MESSAGE || "true").toLowerCase() === "true";
+  String(process.env.SEND_SETUP_LANGUAGE_MESSAGE || "false").toLowerCase() === "true";
 const SEND_SETUP_GREETING_FALLBACK =
-  String(process.env.SEND_SETUP_GREETING_FALLBACK || "true").toLowerCase() === "true";
+  String(process.env.SEND_SETUP_GREETING_FALLBACK || "false").toLowerCase() === "true";
+const ALLOW_GOOGLE_VOICE_ATTRIBUTE =
+  String(process.env.ALLOW_GOOGLE_VOICE_ATTRIBUTE || "false").toLowerCase() === "true";
 
 // Google voice default for Lithuanian
 const GOOGLE_VOICE = process.env.GOOGLE_VOICE || "lt-LT-Standard-B";
@@ -185,7 +187,7 @@ function twiml(wsUrl) {
   if (TTS_PROVIDER === "eleven") {
     const voice = elevenVoiceString();
     if (voice) attrs.push(`voice="${escapeXml(voice)}"`);
-  } else if (GOOGLE_VOICE) {
+  } else if (ALLOW_GOOGLE_VOICE_ATTRIBUTE && GOOGLE_VOICE) {
     attrs.push(`voice="${escapeXml(GOOGLE_VOICE)}"`);
   }
 
@@ -229,6 +231,7 @@ function buildHealthPayload() {
     advancedRelayAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
+    allowGoogleVoiceAttribute: ALLOW_GOOGLE_VOICE_ATTRIBUTE,
   };
 }
 
@@ -893,5 +896,6 @@ server.listen(PORT, () => {
     advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
+    allowGoogleVoiceAttribute: ALLOW_GOOGLE_VOICE_ATTRIBUTE,
   });
 });
