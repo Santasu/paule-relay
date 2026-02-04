@@ -1,4 +1,5 @@
 import http from "http";
+import fs from "fs";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -56,6 +57,10 @@ const TWIML_MODE = String(process.env.TWIML_MODE || "relay").toLowerCase();
 const SAY_DIAGNOSTIC_TEXT =
   process.env.SAY_DIAGNOSTIC_TEXT ||
   "Labas. Tai diagnostinis skambutis. Jeigu girdite mane, TwiML veikia teisingai.";
+const DEBUG_EVENT_LIMIT = Number(process.env.DEBUG_EVENT_LIMIT || 300);
+const ENABLE_FILE_DEBUG_LOG =
+  String(process.env.ENABLE_FILE_DEBUG_LOG || "false").toLowerCase() === "true";
+const DEBUG_LOG_PATH = process.env.DEBUG_LOG_PATH || "/tmp/paule-relay-debug.log";
 
 const METRICS = {
   startedAt: new Date().toISOString(),
@@ -85,6 +90,7 @@ const METRICS = {
 const sessions = new Set();
 const sessionsBySessionId = new Map();
 const sessionsByCallSid = new Map();
+const DEBUG_EVENTS = [];
 
 const LT_MONTHS = {
   "01": "sausio",
@@ -125,13 +131,17 @@ function asId(value) {
 }
 
 function logEvent(eventType, details = {}) {
-  console.log(
-    JSON.stringify({
-      ts: new Date().toISOString(),
-      eventType,
-      ...details,
-    })
-  );
+  const record = {
+    ts: new Date().toISOString(),
+    eventType,
+    ...details,
+  };
+  console.log(JSON.stringify(record));
+  DEBUG_EVENTS.push(record);
+  if (DEBUG_EVENTS.length > DEBUG_EVENT_LIMIT) DEBUG_EVENTS.shift();
+  if (ENABLE_FILE_DEBUG_LOG) {
+    fs.appendFile(DEBUG_LOG_PATH, `${JSON.stringify(record)}\n`, () => {});
+  }
 }
 
 function previewText(text, max = 180) {
@@ -251,6 +261,8 @@ function buildHealthPayload() {
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
     twimlMode: TWIML_MODE,
+    enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+    debugLogPath: DEBUG_LOG_PATH,
     advancedRelayAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
@@ -820,6 +832,61 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url.pathname === "/debug") {
+    const requestedLimit = Number(url.searchParams.get("limit") || 120);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(requestedLimit, DEBUG_EVENT_LIMIT))
+      : 120;
+    const events = DEBUG_EVENTS.slice(-limit);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify(
+        {
+          startedAt: METRICS.startedAt,
+          totalEvents: DEBUG_EVENTS.length,
+          returnedEvents: events.length,
+          events,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (url.pathname === "/debug-log") {
+    fs.readFile(DEBUG_LOG_PATH, "utf8", (err, data) => {
+      if (err) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            message: "Debug log file not found",
+            debugLogPath: DEBUG_LOG_PATH,
+            enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+          })
+        );
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(data);
+    });
+    return;
+  }
+
+  if (url.pathname === "/debug-log-clear") {
+    fs.writeFile(DEBUG_LOG_PATH, "", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          message: "Debug log cleared",
+          debugLogPath: DEBUG_LOG_PATH,
+        })
+      );
+    });
+    return;
+  }
+
   if (url.pathname === "/twiml") {
     const wsUrl = `${toWsUrl(baseUrl(req))}/ws`;
     const mode = String(url.searchParams.get("mode") || TWIML_MODE || "relay").toLowerCase();
@@ -932,6 +999,8 @@ server.listen(PORT, () => {
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
     twimlMode: TWIML_MODE,
+    enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+    debugLogPath: DEBUG_LOG_PATH,
     advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
