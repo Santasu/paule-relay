@@ -61,9 +61,24 @@ const DEBUG_EVENT_LIMIT = Number(process.env.DEBUG_EVENT_LIMIT || 300);
 const ENABLE_FILE_DEBUG_LOG =
   String(process.env.ENABLE_FILE_DEBUG_LOG || "false").toLowerCase() === "true";
 const DEBUG_LOG_PATH = process.env.DEBUG_LOG_PATH || "/tmp/paule-relay-debug.log";
+const EXPECTED_TWILIO_ACCOUNT_SID = process.env.EXPECTED_TWILIO_ACCOUNT_SID || "";
+const EXPECTED_TWILIO_APP_SID = process.env.EXPECTED_TWILIO_APP_SID || "";
+const EXPECTED_TWILIO_PHONE_NUMBER = process.env.EXPECTED_TWILIO_PHONE_NUMBER || "";
 
 const METRICS = {
   startedAt: new Date().toISOString(),
+  http: {
+    healthRequests: 0,
+    metricsRequests: 0,
+    debugRequests: 0,
+    diagnoseRequests: 0,
+    twimlRequests: 0,
+    twimlPostRequests: 0,
+    twimlSayRequests: 0,
+    twimlSayPostRequests: 0,
+    debugLogRequests: 0,
+    debugLogClearRequests: 0,
+  },
   websocket: {
     connections: 0,
     activeSessions: 0,
@@ -84,6 +99,14 @@ const METRICS = {
   twilioErrorCodes: {
     "64101": 0,
     "64107": 0,
+  },
+  twilioWebhook: {
+    byAccountSid: {},
+    byApplicationSid: {},
+    accountMismatchCount: 0,
+    appMismatchCount: 0,
+    phoneNumberMismatchCount: 0,
+    lastTwimlRequest: null,
   },
 };
 
@@ -177,6 +200,199 @@ function requestUrl(req) {
   return new URL(req.url || "/", baseUrl(req));
 }
 
+function incrementObjectCounter(obj, key) {
+  if (!obj || !key) return;
+  obj[key] = (obj[key] || 0) + 1;
+}
+
+function maskSid(value) {
+  const sid = asText(value);
+  if (!sid || sid.length < 8) return sid;
+  return `${sid.slice(0, 4)}...${sid.slice(-4)}`;
+}
+
+function normalizePhone(value) {
+  return asText(value).replace(/[^\d+]/g, "");
+}
+
+function maskPhone(value) {
+  const phone = normalizePhone(value);
+  if (!phone) return "";
+  if (phone.length <= 6) return phone;
+  return `${phone.slice(0, 4)}...${phone.slice(-2)}`;
+}
+
+function readExpectedMatch(actualValue, expectedValue) {
+  if (!expectedValue) return null;
+  const actual = asText(actualValue);
+  if (!actual) return null;
+  return actual === asText(expectedValue);
+}
+
+async function parseRequestPayload(req) {
+  const method = asText(req.method).toUpperCase();
+  if (!["POST", "PUT", "PATCH"].includes(method)) {
+    return { raw: "", form: {}, json: null };
+  }
+
+  let raw = "";
+  for await (const chunk of req) {
+    raw += chunk.toString("utf8");
+    if (raw.length > 1024 * 1024) break;
+  }
+
+  const contentType = asText(req.headers["content-type"]).toLowerCase();
+  const form = {};
+  let json = null;
+
+  if (raw) {
+    if (contentType.includes("application/json")) {
+      try {
+        json = JSON.parse(raw);
+      } catch (error) {
+        // Keep parsing fallbacks.
+      }
+    }
+
+    if (contentType.includes("application/x-www-form-urlencoded") || raw.includes("=")) {
+      const params = new URLSearchParams(raw);
+      for (const [key, value] of params.entries()) form[key] = value;
+    }
+  }
+
+  return { raw, form, json };
+}
+
+function extractWebhookMeta(payload, url) {
+  const form = payload.form || {};
+  const json = payload.json || {};
+  const search = url.searchParams;
+
+  const accountSid = asText(form.AccountSid || json.AccountSid || search.get("AccountSid"));
+  const applicationSid = asText(
+    form.ApplicationSid || json.ApplicationSid || search.get("ApplicationSid")
+  );
+  const callSid = asText(form.CallSid || json.CallSid || search.get("CallSid"));
+  const from = asText(form.From || json.From || search.get("From"));
+  const to = asText(form.To || json.To || search.get("To"));
+
+  return {
+    accountSid,
+    applicationSid,
+    callSid,
+    from,
+    to,
+    hasPayload: Boolean(payload.raw),
+  };
+}
+
+function updateTwilioWebhookMetrics(meta, sourcePath, method) {
+  incrementObjectCounter(METRICS.twilioWebhook.byAccountSid, meta.accountSid || "unknown");
+  incrementObjectCounter(
+    METRICS.twilioWebhook.byApplicationSid,
+    meta.applicationSid || "unknown"
+  );
+
+  const accountMatchesExpected = readExpectedMatch(meta.accountSid, EXPECTED_TWILIO_ACCOUNT_SID);
+  const appMatchesExpected = readExpectedMatch(meta.applicationSid, EXPECTED_TWILIO_APP_SID);
+  const phoneMatchesExpected = readExpectedMatch(
+    normalizePhone(meta.to),
+    normalizePhone(EXPECTED_TWILIO_PHONE_NUMBER)
+  );
+
+  if (accountMatchesExpected === false) METRICS.twilioWebhook.accountMismatchCount += 1;
+  if (appMatchesExpected === false) METRICS.twilioWebhook.appMismatchCount += 1;
+  if (phoneMatchesExpected === false) METRICS.twilioWebhook.phoneNumberMismatchCount += 1;
+
+  METRICS.twilioWebhook.lastTwimlRequest = {
+    ts: new Date().toISOString(),
+    sourcePath,
+    method,
+    accountSid: meta.accountSid,
+    applicationSid: meta.applicationSid,
+    callSid: meta.callSid,
+    from: meta.from,
+    to: meta.to,
+    accountMatchesExpected,
+    appMatchesExpected,
+    phoneMatchesExpected,
+  };
+}
+
+function buildDiagnosis() {
+  const { http, websocket, events, generations, twilioWebhook } = METRICS;
+
+  let category = "UNKNOWN";
+  let likelyCause = "Nepakanka duomenu diagnostikai.";
+  const nextActions = [];
+
+  if (http.twimlSayRequests === 0 && http.twimlRequests === 0) {
+    category = "A";
+    likelyCause = "Twilio apskritai nekviecia webhook URL.";
+    nextActions.push("Patikrink Phone Number webhook URL ir HTTP POST metoda.");
+    nextActions.push("Patikrink, ar numeris tame paciame Twilio account kaip AP SID.");
+  } else if (
+    twilioWebhook.accountMismatchCount > 0 ||
+    twilioWebhook.appMismatchCount > 0 ||
+    twilioWebhook.phoneNumberMismatchCount > 0
+  ) {
+    category = "B";
+    likelyCause = "Webhook kvietimai ateina ne is to pacio account / AP SID / numerio.";
+    nextActions.push("Sulygink TwiML App AP SID su appSid, kuris yra SDK access tokene.");
+    nextActions.push("Sulygink Phone Number webhook su tuo paciu Railway URL ir tuo paciu account.");
+    nextActions.push("Nustatyk EXPECTED_TWILIO_* env, kad serveris parodytu mismatch tiksliai.");
+  } else if (http.twimlSayRequests > 0 && websocket.connections === 0 && http.twimlRequests === 0) {
+    category = "A";
+    likelyCause = "TwiML-Say kelias veikia, bet i Relay dar neperjungta.";
+    nextActions.push("Perjunk URL i /twiml po to, kai /twiml-say testas sekmingas.");
+  } else if (http.twimlRequests > 0 && websocket.connections === 0) {
+    category = "C";
+    likelyCause =
+      "Twilio gauna /twiml, bet nepaleidzia ConversationRelay WS (addendum/onboarding/app capability).";
+    nextActions.push("Ijunk AI/ML Addendum Voice Settings lange.");
+    nextActions.push("Uzkbaik ConversationRelay onboarding tame paciame account.");
+    nextActions.push("Patikrink, ar AP SID ir webhook account sutampa.");
+  } else if (events.setup > 0 && events.prompt === 0) {
+    category = "D";
+    likelyCause = "WS setup ivyko, bet STT prompt neateina.";
+    nextActions.push("Testuok su aiškia kalba, patikrink kalbos/providero nustatymus.");
+  } else if (events.prompt > 0 && generations.failed > 0) {
+    category = "E";
+    likelyCause = "Promptai ateina, bet AI generacija krenta.";
+    nextActions.push("Patikrink OPENAI_API_KEY ir OpenAI model prieinamuma.");
+  } else if (events.prompt > 0 && generations.completed > 0) {
+    category = "OK";
+    likelyCause = "Kvietimu kelias veikia, Relay ir AI atsako.";
+    nextActions.push("Toliau optimizuok TTS/STT kokybe.");
+  }
+
+  return {
+    category,
+    likelyCause,
+    nextActions,
+    expected: {
+      accountSid: maskSid(EXPECTED_TWILIO_ACCOUNT_SID),
+      applicationSid: maskSid(EXPECTED_TWILIO_APP_SID),
+      phoneNumber: maskPhone(EXPECTED_TWILIO_PHONE_NUMBER),
+    },
+    evidence: {
+      twimlPostRequests: http.twimlPostRequests,
+      twimlSayPostRequests: http.twimlSayPostRequests,
+      twimlRequests: http.twimlRequests,
+      twimlSayRequests: http.twimlSayRequests,
+      websocketConnections: websocket.connections,
+      setupEvents: events.setup,
+      promptEvents: events.prompt,
+      generationsStarted: generations.started,
+      generationsFailed: generations.failed,
+      accountMismatchCount: twilioWebhook.accountMismatchCount,
+      appMismatchCount: twilioWebhook.appMismatchCount,
+      phoneNumberMismatchCount: twilioWebhook.phoneNumberMismatchCount,
+      lastTwimlRequest: twilioWebhook.lastTwimlRequest,
+    },
+  };
+}
+
 function safeJsonParse(raw) {
   try {
     return JSON.parse(raw.toString());
@@ -267,6 +483,9 @@ function buildHealthPayload() {
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
     allowGoogleVoiceAttribute: ALLOW_GOOGLE_VOICE_ATTRIBUTE,
+    expectedTwilioAccountSid: maskSid(EXPECTED_TWILIO_ACCOUNT_SID),
+    expectedTwilioAppSid: maskSid(EXPECTED_TWILIO_APP_SID),
+    expectedTwilioPhoneNumber: maskPhone(EXPECTED_TWILIO_PHONE_NUMBER),
   };
 }
 
@@ -809,17 +1028,47 @@ function onTwilioError(ws, message) {
   });
 }
 
-// HTTP server
-const server = http.createServer((req, res) => {
+function shouldTrackWebhookMeta(meta) {
+  return Boolean(
+    meta &&
+      (meta.hasPayload || meta.accountSid || meta.applicationSid || meta.callSid || meta.from || meta.to)
+  );
+}
+
+function isGetOrPost(req) {
+  const method = asText(req.method).toUpperCase();
+  return method === "GET" || method === "POST";
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload, null, 2));
+}
+
+function sendXml(res, xml) {
+  res.writeHead(200, { "Content-Type": "text/xml" });
+  res.end(xml);
+}
+
+function sendMethodNotAllowed(res) {
+  sendJson(res, 405, {
+    error: "Method Not Allowed",
+    allowedMethods: ["GET", "POST"],
+  });
+}
+
+async function handleHttpRequest(req, res) {
   const url = requestUrl(req);
+  const method = asText(req.method).toUpperCase();
 
   if (url.pathname === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(buildHealthPayload()));
+    METRICS.http.healthRequests += 1;
+    sendJson(res, 200, buildHealthPayload());
     return;
   }
 
   if (url.pathname === "/metrics") {
+    METRICS.http.metricsRequests += 1;
     const payload = {
       ...METRICS,
       websocket: {
@@ -827,44 +1076,49 @@ const server = http.createServer((req, res) => {
         activeSessions: sessions.size,
       },
     };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload, null, 2));
+    sendJson(res, 200, payload);
+    return;
+  }
+
+  if (url.pathname === "/diagnose") {
+    METRICS.http.diagnoseRequests += 1;
+    sendJson(res, 200, buildDiagnosis());
     return;
   }
 
   if (url.pathname === "/debug") {
+    METRICS.http.debugRequests += 1;
     const requestedLimit = Number(url.searchParams.get("limit") || 120);
     const limit = Number.isFinite(requestedLimit)
       ? Math.max(1, Math.min(requestedLimit, DEBUG_EVENT_LIMIT))
       : 120;
     const events = DEBUG_EVENTS.slice(-limit);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify(
-        {
-          startedAt: METRICS.startedAt,
-          totalEvents: DEBUG_EVENTS.length,
-          returnedEvents: events.length,
-          events,
-        },
-        null,
-        2
-      )
-    );
+    sendJson(res, 200, {
+      startedAt: METRICS.startedAt,
+      totalEvents: DEBUG_EVENTS.length,
+      returnedEvents: events.length,
+      events,
+    });
     return;
   }
 
   if (url.pathname === "/debug-log") {
+    METRICS.http.debugLogRequests += 1;
+    if (!ENABLE_FILE_DEBUG_LOG) {
+      sendJson(res, 400, {
+        message: "File debug log is disabled",
+        enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+        hint: "Set ENABLE_FILE_DEBUG_LOG=true and redeploy.",
+      });
+      return;
+    }
     fs.readFile(DEBUG_LOG_PATH, "utf8", (err, data) => {
       if (err) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            message: "Debug log file not found",
-            debugLogPath: DEBUG_LOG_PATH,
-            enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
-          })
-        );
+        sendJson(res, 404, {
+          message: "Debug log file not found",
+          debugLogPath: DEBUG_LOG_PATH,
+          enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+        });
         return;
       }
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -874,30 +1128,56 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === "/debug-log-clear") {
+    METRICS.http.debugLogClearRequests += 1;
+    if (!ENABLE_FILE_DEBUG_LOG) {
+      sendJson(res, 400, {
+        message: "File debug log is disabled",
+        enableFileDebugLog: ENABLE_FILE_DEBUG_LOG,
+      });
+      return;
+    }
     fs.writeFile(DEBUG_LOG_PATH, "", () => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "ok",
-          message: "Debug log cleared",
-          debugLogPath: DEBUG_LOG_PATH,
-        })
-      );
+      sendJson(res, 200, {
+        status: "ok",
+        message: "Debug log cleared",
+        debugLogPath: DEBUG_LOG_PATH,
+      });
     });
     return;
   }
 
   if (url.pathname === "/twiml") {
+    METRICS.http.twimlRequests += 1;
+    if (method === "POST") METRICS.http.twimlPostRequests += 1;
+    if (!isGetOrPost(req)) {
+      sendMethodNotAllowed(res);
+      return;
+    }
+
+    const payload = await parseRequestPayload(req);
+    const meta = extractWebhookMeta(payload, url);
+    if (shouldTrackWebhookMeta(meta)) updateTwilioWebhookMetrics(meta, "/twiml", method);
+
     const wsUrl = `${toWsUrl(baseUrl(req))}/ws`;
     const mode = String(url.searchParams.get("mode") || TWIML_MODE || "relay").toLowerCase();
     let xml = twiml(wsUrl);
     if (mode === "say") xml = sayTwiml(SAY_DIAGNOSTIC_TEXT);
     if (mode === "say_then_relay") xml = sayThenRelayTwiml(wsUrl);
 
+    const lastTwimlRequest = METRICS.twilioWebhook.lastTwimlRequest || {};
     logEvent("http.twiml", {
-      method: req.method,
+      method,
       mode,
       wsUrl,
+      payloadBytes: payload.raw.length,
+      accountSid: maskSid(meta.accountSid),
+      applicationSid: maskSid(meta.applicationSid),
+      callSid: maskSid(meta.callSid),
+      from: maskPhone(meta.from),
+      to: maskPhone(meta.to),
+      accountMatchesExpected: lastTwimlRequest.accountMatchesExpected ?? null,
+      appMatchesExpected: lastTwimlRequest.appMatchesExpected ?? null,
+      phoneMatchesExpected: lastTwimlRequest.phoneMatchesExpected ?? null,
       relayLanguage: RELAY_LANGUAGE,
       ttsProvider: twilioTtsProviderName(TTS_PROVIDER),
       ttsLanguage: TTS_LANGUAGE,
@@ -907,23 +1187,57 @@ const server = http.createServer((req, res) => {
       advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     });
 
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(xml);
+    sendXml(res, xml);
     return;
   }
 
   if (url.pathname === "/twiml-say") {
+    METRICS.http.twimlSayRequests += 1;
+    if (method === "POST") METRICS.http.twimlSayPostRequests += 1;
+    if (!isGetOrPost(req)) {
+      sendMethodNotAllowed(res);
+      return;
+    }
+
+    const payload = await parseRequestPayload(req);
+    const meta = extractWebhookMeta(payload, url);
+    if (shouldTrackWebhookMeta(meta)) updateTwilioWebhookMetrics(meta, "/twiml-say", method);
+
+    const lastTwimlRequest = METRICS.twilioWebhook.lastTwimlRequest || {};
     logEvent("http.twiml_say", {
-      method: req.method,
+      method,
+      payloadBytes: payload.raw.length,
+      accountSid: maskSid(meta.accountSid),
+      applicationSid: maskSid(meta.applicationSid),
+      callSid: maskSid(meta.callSid),
+      from: maskPhone(meta.from),
+      to: maskPhone(meta.to),
+      accountMatchesExpected: lastTwimlRequest.accountMatchesExpected ?? null,
+      appMatchesExpected: lastTwimlRequest.appMatchesExpected ?? null,
+      phoneMatchesExpected: lastTwimlRequest.phoneMatchesExpected ?? null,
       relayLanguage: RELAY_LANGUAGE,
     });
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(sayTwiml(SAY_DIAGNOSTIC_TEXT));
+    sendXml(res, sayTwiml(SAY_DIAGNOSTIC_TEXT));
     return;
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("paule-relay running. Endpoints: /twiml /health /metrics");
+  res.end("paule-relay running. Endpoints: /twiml /twiml-say /health /metrics /diagnose");
+}
+
+// HTTP server
+const server = http.createServer((req, res) => {
+  handleHttpRequest(req, res).catch((error) => {
+    logEvent("http.error", {
+      path: req && req.url ? req.url : "",
+      method: asText(req && req.method),
+      message: error && error.message ? error.message : String(error),
+    });
+    sendJson(res, 500, {
+      error: "Internal Server Error",
+      message: "Unhandled request error",
+    });
+  });
 });
 
 // ConversationRelay WebSocket
@@ -1005,5 +1319,8 @@ server.listen(PORT, () => {
     sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
     sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
     allowGoogleVoiceAttribute: ALLOW_GOOGLE_VOICE_ATTRIBUTE,
+    expectedTwilioAccountSid: maskSid(EXPECTED_TWILIO_ACCOUNT_SID),
+    expectedTwilioAppSid: maskSid(EXPECTED_TWILIO_APP_SID),
+    expectedTwilioPhoneNumber: maskPhone(EXPECTED_TWILIO_PHONE_NUMBER),
   });
 });
