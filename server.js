@@ -13,13 +13,18 @@ const RELAY_LANGUAGE = process.env.RELAY_LANGUAGE || "lt-LT";
 const TTS_LANGUAGE = process.env.TTS_LANGUAGE || RELAY_LANGUAGE;
 const TRANSCRIPTION_LANGUAGE = process.env.TRANSCRIPTION_LANGUAGE || RELAY_LANGUAGE;
 const TTS_PROVIDER = normalizeTtsProvider(process.env.TTS_PROVIDER || "google");
-const TRANSCRIPTION_PROVIDER = normalizeTranscriptionProvider(
-  process.env.TRANSCRIPTION_PROVIDER || "Google"
-);
-const SPEECH_MODEL = process.env.SPEECH_MODEL || "telephony";
-const INTERRUPTIBLE = process.env.INTERRUPTIBLE || "speech";
-const REPORT_INPUT_DURING_AGENT_SPEECH =
-  process.env.REPORT_INPUT_DURING_AGENT_SPEECH || "speech";
+const TRANSCRIPTION_PROVIDER = process.env.TRANSCRIPTION_PROVIDER
+  ? normalizeTranscriptionProvider(process.env.TRANSCRIPTION_PROVIDER)
+  : "";
+const SPEECH_MODEL = process.env.SPEECH_MODEL || "";
+const INTERRUPTIBLE = process.env.INTERRUPTIBLE || "";
+const REPORT_INPUT_DURING_AGENT_SPEECH = process.env.REPORT_INPUT_DURING_AGENT_SPEECH || "";
+const ENABLE_ADVANCED_RELAY_ATTRIBUTES =
+  String(process.env.ENABLE_ADVANCED_RELAY_ATTRIBUTES || "false").toLowerCase() === "true";
+const SEND_SETUP_LANGUAGE_MESSAGE =
+  String(process.env.SEND_SETUP_LANGUAGE_MESSAGE || "true").toLowerCase() === "true";
+const SEND_SETUP_GREETING_FALLBACK =
+  String(process.env.SEND_SETUP_GREETING_FALLBACK || "true").toLowerCase() === "true";
 
 // Google voice default for Lithuanian
 const GOOGLE_VOICE = process.env.GOOGLE_VOICE || "lt-LT-Standard-B";
@@ -171,17 +176,10 @@ function elevenVoiceString() {
 function twiml(wsUrl) {
   const attrs = [];
 
+  // Keep TwiML minimal by default to avoid 64101 on strict attribute combinations.
   attrs.push(`url="${escapeXml(wsUrl)}"`);
   attrs.push(`welcomeGreeting="${escapeXml(WELCOME)}"`);
   attrs.push(`language="${escapeXml(RELAY_LANGUAGE)}"`);
-  attrs.push(`ttsLanguage="${escapeXml(TTS_LANGUAGE)}"`);
-  attrs.push(`transcriptionLanguage="${escapeXml(TRANSCRIPTION_LANGUAGE)}"`);
-  attrs.push(`transcriptionProvider="${escapeXml(TRANSCRIPTION_PROVIDER)}"`);
-  attrs.push(`speechModel="${escapeXml(SPEECH_MODEL)}"`);
-  attrs.push(`interruptible="${escapeXml(INTERRUPTIBLE)}"`);
-  attrs.push(
-    `reportInputDuringAgentSpeech="${escapeXml(REPORT_INPUT_DURING_AGENT_SPEECH)}"`
-  );
 
   attrs.push(`ttsProvider="${twilioTtsProviderName(TTS_PROVIDER)}"`);
   if (TTS_PROVIDER === "eleven") {
@@ -189,6 +187,23 @@ function twiml(wsUrl) {
     if (voice) attrs.push(`voice="${escapeXml(voice)}"`);
   } else if (GOOGLE_VOICE) {
     attrs.push(`voice="${escapeXml(GOOGLE_VOICE)}"`);
+  }
+
+  if (ENABLE_ADVANCED_RELAY_ATTRIBUTES) {
+    if (TTS_LANGUAGE) attrs.push(`ttsLanguage="${escapeXml(TTS_LANGUAGE)}"`);
+    if (TRANSCRIPTION_LANGUAGE) {
+      attrs.push(`transcriptionLanguage="${escapeXml(TRANSCRIPTION_LANGUAGE)}"`);
+    }
+    if (TRANSCRIPTION_PROVIDER) {
+      attrs.push(`transcriptionProvider="${escapeXml(TRANSCRIPTION_PROVIDER)}"`);
+    }
+    if (SPEECH_MODEL) attrs.push(`speechModel="${escapeXml(SPEECH_MODEL)}"`);
+    if (INTERRUPTIBLE) attrs.push(`interruptible="${escapeXml(INTERRUPTIBLE)}"`);
+    if (REPORT_INPUT_DURING_AGENT_SPEECH) {
+      attrs.push(
+        `reportInputDuringAgentSpeech="${escapeXml(REPORT_INPUT_DURING_AGENT_SPEECH)}"`
+      );
+    }
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -211,6 +226,9 @@ function buildHealthPayload() {
     transcriptionProvider: TRANSCRIPTION_PROVIDER,
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
+    advancedRelayAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
+    sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
+    sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
   };
 }
 
@@ -220,6 +238,7 @@ function createSession({ sessionId, callSid }) {
     callSid: callSid || "",
     promptBuffer: "",
     generationId: 0,
+    sentSetupGreeting: false,
     abortController: null,
     busy: false,
     createdAt: Date.now(),
@@ -655,6 +674,31 @@ function onSetup(ws, message) {
     sessionId: session.sessionId,
     callSid: session.callSid,
   });
+
+  if (SEND_SETUP_LANGUAGE_MESSAGE) {
+    ws.send(
+      JSON.stringify({
+        type: "language",
+        ttsLanguage: TTS_LANGUAGE || RELAY_LANGUAGE,
+        transcriptionLanguage: TRANSCRIPTION_LANGUAGE || RELAY_LANGUAGE,
+      })
+    );
+    logEvent("ws.send.language", {
+      sessionId: session.sessionId,
+      callSid: session.callSid,
+      ttsLanguage: TTS_LANGUAGE || RELAY_LANGUAGE,
+      transcriptionLanguage: TRANSCRIPTION_LANGUAGE || RELAY_LANGUAGE,
+    });
+  }
+
+  if (SEND_SETUP_GREETING_FALLBACK && !session.sentSetupGreeting) {
+    session.sentSetupGreeting = true;
+    sendTextToken(ws, normalizeForTtsLt(WELCOME), true, session);
+    logEvent("ws.send.setup_greeting", {
+      sessionId: session.sessionId,
+      callSid: session.callSid,
+    });
+  }
 }
 
 function onPrompt(ws, message) {
@@ -762,6 +806,7 @@ const server = http.createServer((req, res) => {
       transcriptionProvider: TRANSCRIPTION_PROVIDER,
       transcriptionLanguage: TRANSCRIPTION_LANGUAGE,
       speechModel: SPEECH_MODEL,
+      advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
     });
 
     res.writeHead(200, { "Content-Type": "text/xml" });
@@ -845,5 +890,8 @@ server.listen(PORT, () => {
     transcriptionProvider: TRANSCRIPTION_PROVIDER,
     speechModel: SPEECH_MODEL,
     openaiModel: OPENAI_MODEL,
+    advancedAttributes: ENABLE_ADVANCED_RELAY_ATTRIBUTES,
+    sendSetupLanguageMessage: SEND_SETUP_LANGUAGE_MESSAGE,
+    sendSetupGreetingFallback: SEND_SETUP_GREETING_FALLBACK,
   });
 });
