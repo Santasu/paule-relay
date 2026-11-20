@@ -2,6 +2,8 @@
 
 Twilio ConversationRelay relay server for inbound/outbound AI calls with OpenAI.
 
+For the current product and its Lithuanian calling workflows, see [AI calling in Paule.ai](https://paule.ai/ai-skambuciai/).
+
 Current default profile is tuned for Lithuanian "balanced" quality:
 - TTS: Google
 - Voice: `lt-LT-Standard-B`
